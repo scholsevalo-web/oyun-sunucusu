@@ -102,7 +102,13 @@ async def lobby_handler(websocket):
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
-    async with websockets.serve(lobby_handler, "0.0.0.0", port):
+    async with websockets.serve(
+        lobby_handler,
+        "0.0.0.0",
+        port,
+        ping_interval=5,
+        ping_timeout=5,
+    ):
         await asyncio.Future()
 
 if __name__ == "__main__":
