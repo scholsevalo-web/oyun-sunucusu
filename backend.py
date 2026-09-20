@@ -223,7 +223,6 @@ async def handle(ws, data):
             await broadcast(room, room_state(room))
 
     elif action == "relay":
-        # Oyun içi mesajlar: sunucu içeriğe karışmaz, sadece odadaki diğerlerine iletir.
         if room["phase"] != "playing":
             return
         payload = data.get("data")
@@ -235,6 +234,28 @@ async def handle(ws, data):
             await broadcast(room, out, only=str(to))
         else:
             await broadcast(room, out, exclude=ws)
+
+    elif action == "chat":
+        if room:
+            text = str(data.get("text", "")).strip()[:150]
+            if text:
+                await broadcast(room, {
+                    "type": "chat",
+                    "from": me["name"],
+                    "text": text,
+                    "team": me.get("team")
+                })
+
+    elif action == "signal":
+        if room:
+            to_id = data.get("to")
+            signal_data = data.get("signal")
+            if to_id and signal_data:
+                await broadcast(room, {
+                    "type": "signal",
+                    "from": me["id"],
+                    "signal": signal_data
+                }, only=str(to_id))
 
 
 async def lobby_handler(websocket):
