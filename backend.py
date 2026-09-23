@@ -7,13 +7,9 @@ import string
 
 import websockets
 
-ROOM_CAPACITY = 4
+ROOM_CAPACITY = 10          # toplam slot (mavi + kırmızı)
+TEAM_MAX = 5                # takım başına en fazla slot
 GAMES = {"prison", "fps"}
-
-# Oyuncu sayısına göre FPS modu ve takım kapasiteleri: (Mavi, Kırmızı)
-#   2 kişi -> 1v1,  3 kişi -> 1v2 (Mavi tek kişi),  4 kişi -> 2v2
-FPS_CAPS = {2: (1, 1), 3: (1, 2), 4: (2, 2)}
-FPS_MODE_NAMES = {2: "1v1", 3: "1v2", 4: "2v2"}
 
 rooms = {}    # oda_kodu -> oda sözlüğü
 clients = {}  # websocket -> {"room": kod, "id": oyuncu_id}
@@ -38,57 +34,56 @@ def clean_name(raw, room=None):
     return name
 
 
+def team_sizes(room):
+    s = [0, 0]
+    for p in room["players"]:
+        s[p["team"]] += 1
+    return s
+
+
+def pick_team(room, preferred=None):
+    """Katılan oyuncu için takım seç: tercih > en boş takım."""
+    sizes = team_sizes(room)
+    if preferred in (0, 1) and sizes[preferred] < room["teamSizes"][preferred]:
+        return preferred
+    return 0 if sizes[0] <= sizes[1] else 1
+
+
+def reflow_teams(room):
+    """Slot değişiminde taşan oyuncuları boş slotlara kaydır."""
+    sizes = team_sizes(room)
+    moved = True
+    while moved:
+        moved = False
+        for t in (0, 1):
+            while sizes[t] > room["teamSizes"][t]:
+                other = 1 - t
+                if sizes[other] < room["teamSizes"][other]:
+                    p = next(p for p in room["players"] if p["team"] == t)
+                    p["team"] = other
+                    sizes[t] -= 1
+                    sizes[other] += 1
+                    moved = True
+                else:
+                    room["teamSizes"][t] = sizes[t]
+                    break
+
+
 def room_state(room):
-    n = len(room["players"])
-    mode = room.get("mode") if room["phase"] == "playing" else FPS_MODE_NAMES.get(n)
     return {
         "type": "room_state",
         "code": room["code"],
         "phase": room["phase"],
         "game": room["game"],
-        "mode": mode,
         "seed": room["seed"],
         "host": room["players"][0]["id"],
+        "maxPlayers": ROOM_CAPACITY,
+        "teamSizes": list(room["teamSizes"]),
         "players": [
             {"id": p["id"], "name": p["name"], "team": p["team"]}
             for p in room["players"]
         ],
     }
-
-
-def rebalance_teams(room):
-    """Oyuncu sayısına göre takımları kapasiteye uydurur; mevcut seçimleri mümkün olduğunca korur."""
-    players = room["players"]
-    caps = FPS_CAPS.get(len(players))
-    if not caps:
-        for i, p in enumerate(players):
-            p["team"] = i % 2
-        return
-    counts = [0, 0]
-    leftovers = []
-    for p in players:
-        t = p.get("team")
-        if t in (0, 1) and counts[t] < caps[t]:
-            counts[t] += 1
-        else:
-            leftovers.append(p)
-    for p in leftovers:
-        t = 0 if counts[0] < caps[0] else 1
-        p["team"] = t
-        counts[t] += 1
-
-
-def switch_team(room, player):
-    caps = FPS_CAPS.get(len(room["players"]))
-    if not caps:
-        return
-    target = 1 - player["team"]
-    members = [p for p in room["players"] if p["team"] == target]
-    if len(members) < caps[target]:
-        player["team"] = target
-    elif members:  # hedef takım dolu: ilk oyuncuyla yer değiştir
-        other = members[0]
-        other["team"], player["team"] = player["team"], target
 
 
 async def safe_send(ws, msg):
@@ -124,8 +119,6 @@ async def remove_client(ws):
     if not room["players"]:
         rooms.pop(room["code"], None)
         return
-    if room["phase"] == "lobby":
-        rebalance_teams(room)
     await broadcast(room, room_state(room))
 
 
@@ -151,7 +144,7 @@ async def handle(ws, data):
         }
         new = {
             "code": code, "players": [player], "game": None,
-            "phase": "lobby", "seed": 0, "mode": None,
+            "phase": "lobby", "seed": 0, "teamSizes": [1, 1],
         }
         rooms[code] = new
         clients[ws] = {"room": code, "id": player["id"]}
@@ -167,17 +160,25 @@ async def handle(ws, data):
             await send(ws, {"type": "error", "message": "Böyle bir oda bulunamadı! Kodu kontrol et."})
         elif target["phase"] != "lobby":
             await send(ws, {"type": "error", "message": "Bu odada oyun başlamış, bitmesini bekle."})
-        elif len(target["players"]) >= ROOM_CAPACITY:
-            await send(ws, {"type": "error", "message": f"Oda şu an tam kapasite ({ROOM_CAPACITY} kişi)!"})
         else:
+            sizes = team_sizes(target)
+            preferred = data.get("team")
+            if preferred not in (0, 1):
+                preferred = None
+            if preferred is not None and sizes[preferred] >= target["teamSizes"][preferred]:
+                label = "Mavi" if preferred == 0 else "Kırmızı"
+                await send(ws, {"type": "error", "message": f"{label} takım dolu!"})
+                return
+            if sum(sizes) >= sum(target["teamSizes"]):
+                await send(ws, {"type": "error", "message": "Oda tamamen dolu!"})
+                return
             player = {
                 "id": secrets.token_hex(3),
                 "ws": ws,
                 "name": clean_name(data.get("name"), target),
-                "team": 0,
+                "team": pick_team(target, preferred),
             }
             target["players"].append(player)
-            rebalance_teams(target)
             clients[ws] = {"room": code, "id": player["id"]}
             await send(ws, {"type": "joined", "id": player["id"]})
             await broadcast(target, room_state(target))
@@ -193,33 +194,62 @@ async def handle(ws, data):
         game = data.get("game")
         if is_host and room["phase"] == "lobby" and game in GAMES:
             room["game"] = game
-            rebalance_teams(room)
             await broadcast(room, room_state(room))
+
+    elif action == "set_team_size":
+        if is_host and room["phase"] == "lobby" and room["game"] == "fps":
+            t = data.get("team")
+            d = data.get("delta")
+            if t in (0, 1) and d in (-1, 1):
+                sizes = team_sizes(room)
+                nxt = room["teamSizes"][t] + d
+                if 1 <= nxt <= TEAM_MAX:
+                    other = 1 - t
+                    if d == -1 and sizes[t] > nxt:
+                        # küçültme: o takımdaki fazlalığı diğer takıma kaydır (yol varsa)
+                        if sizes[other] < room["teamSizes"][other]:
+                            p = next(p for p in room["players"] if p["team"] == t)
+                            p["team"] = other
+                        else:
+                            return
+                    if d == 1 and sum(room["teamSizes"]) >= ROOM_CAPACITY:
+                        await send(ws, {"type": "error", "message": f"Toplam slot {ROOM_CAPACITY} kişiyi geçemez!"})
+                        return
+                    room["teamSizes"][t] = nxt
+                    reflow_teams(room)
+                    await broadcast(room, room_state(room))
 
     elif action == "switch_team":
         if room["phase"] == "lobby" and room["game"] == "fps":
-            switch_team(room, me)
-            await broadcast(room, room_state(room))
+            target = 1 - me["team"]
+            sizes = team_sizes(room)
+            if sizes[target] < room["teamSizes"][target]:
+                me["team"] = target
+                await broadcast(room, room_state(room))
+            else:
+                await send(ws, {"type": "error", "message": "Karşı takım dolu!"})
 
     elif action == "start_game":
         if not is_host or room["phase"] != "lobby":
             return
-        n = len(room["players"])
         if room["game"] not in GAMES:
             await send(ws, {"type": "error", "message": "Önce bir oyun seç!"})
-        elif n < 2:
+            return
+        sizes = team_sizes(room)
+        if len(room["players"]) < 2:
             await send(ws, {"type": "error", "message": "Başlamak için en az 2 oyuncu gerekli!"})
-        else:
-            rebalance_teams(room)
-            room["phase"] = "playing"
-            room["seed"] = random.randint(1, 2**31 - 1)
-            room["mode"] = FPS_MODE_NAMES.get(n)
-            await broadcast(room, room_state(room))
+            return
+        if room["game"] == "fps" and (sizes[0] == 0 or sizes[1] == 0):
+            await send(ws, {"type": "error", "message": "Her iki takımda da en az 1 oyuncu olmalı!"})
+            return
+        room["phase"] = "playing"
+        room["seed"] = random.randint(1, 2**31 - 1)
+        await broadcast(room, room_state(room))
 
     elif action == "return_lobby":
         if is_host and room["phase"] == "playing":
             room["phase"] = "lobby"
-            rebalance_teams(room)
+            reflow_teams(room)
             await broadcast(room, room_state(room))
 
     elif action == "relay":
