@@ -4,6 +4,7 @@ import os
 import random
 import secrets
 import string
+import time
 
 import websockets
 
@@ -13,6 +14,50 @@ GAMES = {"prison", "fps"}
 
 rooms = {}    # oda_kodu -> oda sözlüğü
 clients = {}  # websocket -> {"room": kod, "id": oyuncu_id}
+
+# ------------------------------------------------------- sunucu geri sayımı
+# freeze (hazırlık) süresini sunucu sayar: herkes aynı süreyi görür.
+# timeLeft > 5 iken ekranı açık olmayan (heartbeat göndermeyen) oyuncu varsa
+# sayım durur; 5 ve altında kalan son kısım her durumda sayılır.
+HEARTBEAT_TIMEOUT = 6.0     # bu kadar saniye heartbeat gelmeyen oyuncu "kapalı" sayılır
+COUNTDOWN_FLOOR = 5.0       # bu değerin altında ekran kapalı olsa da sayım devam eder
+
+
+def screen_open(room):
+    """Kalp atışı bilgisi olmayanlar 'açık' sayılır; sadece açıkça 'kapalı'
+    bildiren (open=False heartbeat'i gelen ve süresi henüz geçmemiş) oyuncular bloklar."""
+    now = time.monotonic()
+    for p in room["players"]:
+        b = p.get("beat", -1)
+        if b == 0.0:
+            return False   # açıkça kapalı bildirmiş
+        if b > 0.0 and now - b > HEARTBEAT_TIMEOUT:
+            return False   # açık bildirmişti ama süresi çok eskidi (yeni open gelmedi)
+    return True
+
+
+async def countdown_task(room):
+    """playing fazında freeze süresini sunucu tarafında ilerletir."""
+    try:
+        while True:
+            await asyncio.sleep(0.25)
+            if room["phase"] != "playing" or not room["players"]:
+                continue
+            gs = room.get("gameState")
+            if not gs or gs.get("phase") != "freeze":
+                continue
+            t = gs.get("timeLeft", 0)
+            if t <= 0:
+                continue
+            if t > COUNTDOWN_FLOOR and not screen_open(room):
+                continue  # ekranı kapalı oyuncu var, bekle
+            gs["timeLeft"] = max(0.0, t - 0.25)
+            await broadcast(room, {"type": "countdown", "phase": gs["phase"], "timeLeft": gs["timeLeft"], "round": gs.get("round", 0)})
+    except asyncio.CancelledError:
+        raise
+
+
+countdowns = {}  # kod -> task
 
 
 # ---------------------------------------------------------------- yardımcılar
@@ -106,6 +151,22 @@ async def broadcast(room, obj, exclude=None, only=None):
     ]
     if targets:
         await asyncio.gather(*(safe_send(ws, msg) for ws in targets))
+
+
+async def safe_handle(ws, data):
+    action = data.get("action")
+    if action == "heartbeat":
+        info = clients.get(ws)
+        room = rooms.get(info["room"]) if info else None
+        if room:
+            me = next((p for p in room["players"] if p["ws"] is ws), None)
+            if me:
+                if data.get("open") is True:
+                    me["beat"] = time.monotonic()      # ekranı açık: sayım akabilir
+                elif "beat" in me:
+                    me["beat"] = 0.0                    # ekranı kapalı: sayımı durdur
+        return
+    await handle(ws, data)
 
 
 async def remove_client(ws):
@@ -257,11 +318,23 @@ async def handle(ws, data):
             return
         room["phase"] = "playing"
         room["seed"] = random.randint(1, 2**31 - 1)
+        # sunucu taraflı oyun durumu: sadece hazırlık (freeze) süresini yönetir
+        room["gameState"] = {"phase": "freeze", "round": 1, "timeLeft": 10.0}
+        for p in room["players"]:
+            p["beat"] = 0.0   # ilk "open" heartbeat'i gelene kadar sayim bekle
+        task = countdowns.pop(room["code"], None)
+        if task:
+            task.cancel()
+        countdowns[room["code"]] = asyncio.create_task(countdown_task(room))
         await broadcast(room, room_state(room))
 
     elif action == "return_lobby":
         if is_host and room["phase"] == "playing":
             room["phase"] = "lobby"
+            room["gameState"] = None
+            task = countdowns.pop(room["code"], None)
+            if task:
+                task.cancel()
             reflow_teams(room)
             await broadcast(room, room_state(room))
 
@@ -309,7 +382,7 @@ async def lobby_handler(websocket):
             except (ValueError, TypeError):
                 continue
             if isinstance(data, dict):
-                await handle(websocket, data)
+                await safe_handle(websocket, data)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
