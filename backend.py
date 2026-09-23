@@ -159,7 +159,20 @@ async def handle(ws, data):
         if not target:
             await send(ws, {"type": "error", "message": "Böyle bir oda bulunamadı! Kodu kontrol et."})
         elif target["phase"] != "lobby":
-            await send(ws, {"type": "error", "message": "Bu odada oyun başlamış, bitmesini bekle."})
+            # F5 / sekme yenileme sonrası devam etmek için oyuncuyu geri al
+            if data.get("rejoin") and sum(team_sizes(target)) < sum(target["teamSizes"]):
+                player = {
+                    "id": secrets.token_hex(3),
+                    "ws": ws,
+                    "name": clean_name(data.get("name"), target),
+                    "team": pick_team(target),
+                }
+                target["players"].append(player)
+                clients[ws] = {"room": code, "id": player["id"]}
+                await send(ws, {"type": "joined", "id": player["id"]})
+                await broadcast(target, room_state(target))
+            else:
+                await send(ws, {"type": "error", "message": "Bu odada oyun başlamış, bitmesini bekle."})
         else:
             sizes = team_sizes(target)
             preferred = data.get("team")
