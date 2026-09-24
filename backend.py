@@ -21,6 +21,7 @@ clients = {}  # websocket -> {"room": kod, "id": oyuncu_id}
 # sayım durur; 5 ve altında kalan son kısım her durumda sayılır.
 HEARTBEAT_TIMEOUT = 6.0     # bu kadar saniye heartbeat gelmeyen oyuncu "kapalı" sayılır
 COUNTDOWN_FLOOR = 5.0       # bu değerin altında ekran kapalı olsa da sayım devam eder
+FREEZE_TIME = 5.0           # her raund öncesi hazırlık süresi (istemci ile aynı olmalı)
 
 
 def screen_open(room):
@@ -204,7 +205,7 @@ async def handle(ws, data):
             "team": 0,
         }
         new = {
-            "code": code, "players": [player], "game": None,
+            "code": code, "players": [player], "game": "fps",
             "phase": "lobby", "seed": 0, "teamSizes": [1, 1],
         }
         rooms[code] = new
@@ -319,7 +320,7 @@ async def handle(ws, data):
         room["phase"] = "playing"
         room["seed"] = random.randint(1, 2**31 - 1)
         # sunucu taraflı oyun durumu: sadece hazırlık (freeze) süresini yönetir
-        room["gameState"] = {"phase": "freeze", "round": 1, "timeLeft": 10.0}
+        room["gameState"] = {"phase": "freeze", "round": 1, "timeLeft": FREEZE_TIME}
         for p in room["players"]:
             p["beat"] = 0.0   # ilk "open" heartbeat'i gelene kadar sayim bekle
         task = countdowns.pop(room["code"], None)
@@ -327,6 +328,19 @@ async def handle(ws, data):
             task.cancel()
         countdowns[room["code"]] = asyncio.create_task(countdown_task(room))
         await broadcast(room, room_state(room))
+
+    elif action == "fps_new_round":
+        # host istemci yeni bir freeze fazı başladığında sunucuya bildirir
+        # böylece 2. raund ve sonrası için geri sayım yeniden başlar
+        if is_host and room["phase"] == "playing":
+            gs = room.get("gameState")
+            if gs:
+                gs["phase"] = "freeze"
+                gs["timeLeft"] = FREEZE_TIME
+                gs["round"] = data.get("round", gs.get("round", 1))
+            else:
+                room["gameState"] = {"phase": "freeze", "round": data.get("round", 1), "timeLeft": FREEZE_TIME}
+
 
     elif action == "return_lobby":
         if is_host and room["phase"] == "playing":
